@@ -1,35 +1,63 @@
-# OpenVLA Full fine-tuning config — LIBERO dataset
-# Hyperparameters follow Kim et al., "OpenVLA" (2024), §B.2
-# https://arxiv.org/abs/2406.09246
+# ============================================================
+# OpenVLA Full Fine-tuning Config — LIBERO
+# ============================================================
 #
-# Full fine-tuning: all model parameters updated (no LoRA)
-# Designed for B200 × 16 GPU setup (FSDP ZeRO-3)
+# 참고 논문: Kim et al., "OpenVLA" (2024), arXiv:2406.09246
+#
+# [Full Fine-tuning 설정 근거]
+#   - OpenVLA 논문은 LoRA(LR=5e-4)를 사용했으나, 본 실험은 Full FT 방식
+#   - Full FT LR: 2e-5  (대형 모델 Full FT 표준; LoRA 5e-4의 1/25 수준)
+#     → 너무 높으면 catastrophic forgetting 발생
+#   - 배치: 16/GPU × 16 GPU = 256  (논문 per-GPU 배치 16 동일, GPU 수 증가)
+#   - 스텝: 논문 기준 50K(Spatial/Object), 80K(LIBERO-10) 따름
+#   - FSDP ZeRO-3: 16 GPU에 파라미터+옵티마이저 상태 분산
+# ============================================================
 
 model:
   pretrained: "openvla/openvla-7b"
+  # flash_attention_2: Ampere+ GPU (A100/H100/B200) 필수
+  # 빌드 실패 시 "eager"로 변경
   attn_implementation: "flash_attention_2"
   image_size: 224
-  # Gradient checkpointing saves activation memory at slight compute cost
+  # Full FT에서 activation memory 절약 필수
   gradient_checkpointing: true
 
+lora:
+  enabled: false   # Full fine-tuning — LoRA 비사용
+
 training:
-  # LR: 2e-5 with 500-step linear warmup, then constant (OpenVLA paper §B.2)
-  # For full FT, 1e-5 is more conservative (less forgetting risk)
+  # ── Learning rate ──────────────────────────────────────────
+  # Full FT 기준: 2e-5 (LoRA 5e-4와 다름)
+  # 더 보수적으로 가려면 1e-5 사용
   learning_rate: 2.0e-5
+  # 500 스텝 선형 warmup 후 constant 유지 (논문 §B.2)
   lr_scheduler: "constant_with_warmup"
   warmup_steps: 500
-  # B200 × 16GPU, batch=16/GPU → effective batch = 256
-  # 400K frames / 256 ≈ 1560 steps/epoch → 10K steps ≈ 6 epochs
-  max_steps: 10000
+
+  # ── Steps ──────────────────────────────────────────────────
+  # 논문 기준: Spatial/Object=50K, Goal=60K, LIBERO-10=80K
+  # B200×16 유효배치=256 기준 400K프레임 ≈ 1560 steps/epoch
+  # 50K steps ≈ 32 epochs
+  max_steps: 50000
+
+  # ── Batch ──────────────────────────────────────────────────
+  # 논문과 동일한 GPU당 배치 16
+  # 유효 배치 = 16 × 16 GPU = 256
   per_device_train_batch_size: 16
   gradient_accumulation_steps: 1
-  # AdamW: β1=0.9, β2=0.95 (OpenVLA paper §B.2)
+
+  # ── Optimizer (AdamW, 논문 §B.2) ───────────────────────────
   weight_decay: 0.1
   adam_beta1: 0.9
   adam_beta2: 0.95
   max_grad_norm: 1.0
-  bf16: true
-  save_steps: 1000
+
+  # ── Precision ──────────────────────────────────────────────
+  bf16: true      # B200 native BF16
+  tf32: true      # Tensor Core 활용
+
+  # ── Checkpoint / Log ───────────────────────────────────────
+  save_steps: 5000
   save_total_limit: 5
   logging_steps: 50
   dataloader_num_workers: 4
@@ -39,4 +67,5 @@ data:
   action_bins: 256
   action_dim: 7
   camera_key: "observation.images.image"
+  # actions → [-1,1] 정규화: min/max 사용
   norm_mode: "minmax"
