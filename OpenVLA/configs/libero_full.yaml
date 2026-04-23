@@ -1,0 +1,42 @@
+# OpenVLA Full fine-tuning config — LIBERO dataset
+# Hyperparameters follow Kim et al., "OpenVLA" (2024), §B.2
+# https://arxiv.org/abs/2406.09246
+#
+# Full fine-tuning: all model parameters updated (no LoRA)
+# Designed for B200 × 16 GPU setup (FSDP ZeRO-3)
+
+model:
+  pretrained: "openvla/openvla-7b"
+  attn_implementation: "flash_attention_2"
+  image_size: 224
+  # Gradient checkpointing saves activation memory at slight compute cost
+  gradient_checkpointing: true
+
+training:
+  # LR: 2e-5 with 500-step linear warmup, then constant (OpenVLA paper §B.2)
+  # For full FT, 1e-5 is more conservative (less forgetting risk)
+  learning_rate: 2.0e-5
+  lr_scheduler: "constant_with_warmup"
+  warmup_steps: 500
+  # B200 × 16GPU, batch=16/GPU → effective batch = 256
+  # 400K frames / 256 ≈ 1560 steps/epoch → 10K steps ≈ 6 epochs
+  max_steps: 10000
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 1
+  # AdamW: β1=0.9, β2=0.95 (OpenVLA paper §B.2)
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  max_grad_norm: 1.0
+  bf16: true
+  save_steps: 1000
+  save_total_limit: 5
+  logging_steps: 50
+  dataloader_num_workers: 4
+  seed: 42
+
+data:
+  action_bins: 256
+  action_dim: 7
+  camera_key: "observation.images.image"
+  norm_mode: "minmax"

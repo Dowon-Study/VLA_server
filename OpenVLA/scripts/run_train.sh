@@ -1,39 +1,35 @@
 #!/bin/bash
 # =============================================================================
-# run_train.sh  —  OpenVLA LoRA fine-tuning launcher for B200 server
+# run_train.sh  —  OpenVLA full fine-tuning launcher (B200 × 16 GPU, FSDP)
 #
 # Usage:
-#   bash scripts/run_train.sh                                # defaults
-#   bash scripts/run_train.sh --dataset_root /data/libero   # custom path
-#   bash scripts/run_train.sh --max_steps 100000 --wandb    # more steps
-#   bash scripts/run_train.sh --ngpu 2                      # 2 GPUs
+#   bash scripts/run_train.sh --dataset_root /data/dataset_hf_aug_mix
+#   bash scripts/run_train.sh --dataset_root /data --ngpu 8
+#   bash scripts/run_train.sh --dataset_root /data --max_steps 20000 --wandb
+#   bash scripts/run_train.sh --dataset_root /data --no_aug   # aug 없는 baseline
 # =============================================================================
 
 set -e
 
-# ── Python environment ────────────────────────────────────────────────────────
-# Adjust CONDA_ENV if your env name differs
 CONDA_ENV="openvla"
-PYTHON="$(conda run -n $CONDA_ENV which python 2>/dev/null || echo python)"
-
-# ── Default paths (override via CLI) ─────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATASET_ROOT=""           # Required — set to lerobot-format merged dataset path
-OUTPUT_ROOT="$SCRIPT_DIR/runs"
-CONFIG="$SCRIPT_DIR/configs/libero_lora.yaml"
 
-# ── Training overrides (leave empty to use config file values) ────────────────
+# ── 기본값 ────────────────────────────────────────────────────────────────────
+DATASET_ROOT=""
+OUTPUT_ROOT="$SCRIPT_DIR/runs"
+CONFIG="$SCRIPT_DIR/configs/libero_full.yaml"
+FSDP_CONFIG="$SCRIPT_DIR/configs/fsdp_config.yaml"
+
 MAX_STEPS=""
 BATCH_SIZE=""
 LR=""
-LORA_RANK=""
 SAVE_STEPS=""
 CAMERA_KEY=""
 WANDB_ENABLE=false
 RUN_NAME=""
 NGPU=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 1)
 
-# ── CLI parsing ───────────────────────────────────────────────────────────────
+# ── CLI 파싱 ──────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
         --dataset_root)   DATASET_ROOT="$2"; shift 2 ;;
@@ -42,7 +38,6 @@ while [[ $# -gt 0 ]]; do
         --max_steps)      MAX_STEPS="$2"; shift 2 ;;
         --batch_size)     BATCH_SIZE="$2"; shift 2 ;;
         --lr)             LR="$2"; shift 2 ;;
-        --lora_rank)      LORA_RANK="$2"; shift 2 ;;
         --save_steps)     SAVE_STEPS="$2"; shift 2 ;;
         --camera_key)     CAMERA_KEY="$2"; shift 2 ;;
         --run_name)       RUN_NAME="$2"; shift 2 ;;
@@ -52,71 +47,63 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── Validate ──────────────────────────────────────────────────────────────────
+# ── 검증 ──────────────────────────────────────────────────────────────────────
 if [ -z "$DATASET_ROOT" ]; then
     echo "[ERROR] --dataset_root is required."
     echo "  Example: bash scripts/run_train.sh --dataset_root /data/dataset_hf_aug_mix"
     exit 1
 fi
 if [ ! -d "$DATASET_ROOT/meta" ]; then
-    echo "[ERROR] $DATASET_ROOT does not look like a lerobot dataset (no meta/ dir)."
+    echo "[ERROR] $DATASET_ROOT 은 lerobot 데이터셋이 아닙니다 (meta/ 없음)."
     exit 1
 fi
 
-# ── Output directory with timestamp ──────────────────────────────────────────
+# ── FSDP config: GPU 수에 따라 num_processes 업데이트 ─────────────────────────
+TMP_FSDP_CONFIG="$SCRIPT_DIR/configs/fsdp_config_runtime.yaml"
+sed "s/num_processes: 16/num_processes: $NGPU/" "$FSDP_CONFIG" > "$TMP_FSDP_CONFIG"
+
+# ── 출력 디렉터리 ─────────────────────────────────────────────────────────────
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RUN_NAME="${RUN_NAME:-openvla_libero_lora_${TIMESTAMP}}"
+RUN_NAME="${RUN_NAME:-openvla_full_${TIMESTAMP}}"
 OUTPUT_DIR="$OUTPUT_ROOT/$RUN_NAME"
 mkdir -p "$OUTPUT_DIR"
 
-# ── Build optional CLI args ───────────────────────────────────────────────────
-EXTRA_ARGS=""
-[ -n "$MAX_STEPS"   ] && EXTRA_ARGS="$EXTRA_ARGS --max_steps $MAX_STEPS"
-[ -n "$BATCH_SIZE"  ] && EXTRA_ARGS="$EXTRA_ARGS --batch_size $BATCH_SIZE"
-[ -n "$LR"          ] && EXTRA_ARGS="$EXTRA_ARGS --lr $LR"
-[ -n "$LORA_RANK"   ] && EXTRA_ARGS="$EXTRA_ARGS --lora_rank $LORA_RANK"
-[ -n "$SAVE_STEPS"  ] && EXTRA_ARGS="$EXTRA_ARGS --save_steps $SAVE_STEPS"
-[ -n "$CAMERA_KEY"  ] && EXTRA_ARGS="$EXTRA_ARGS --camera_key $CAMERA_KEY"
-[ -n "$RUN_NAME"    ] && EXTRA_ARGS="$EXTRA_ARGS --run_name $RUN_NAME"
+# ── 추가 인자 조립 ────────────────────────────────────────────────────────────
+EXTRA_ARGS="--run_name $RUN_NAME"
+[ -n "$MAX_STEPS"  ] && EXTRA_ARGS="$EXTRA_ARGS --max_steps $MAX_STEPS"
+[ -n "$BATCH_SIZE" ] && EXTRA_ARGS="$EXTRA_ARGS --batch_size $BATCH_SIZE"
+[ -n "$LR"         ] && EXTRA_ARGS="$EXTRA_ARGS --lr $LR"
+[ -n "$SAVE_STEPS" ] && EXTRA_ARGS="$EXTRA_ARGS --save_steps $SAVE_STEPS"
+[ -n "$CAMERA_KEY" ] && EXTRA_ARGS="$EXTRA_ARGS --camera_key $CAMERA_KEY"
 [ "$WANDB_ENABLE" = "true" ] && EXTRA_ARGS="$EXTRA_ARGS --wandb"
 
-# ── Info ──────────────────────────────────────────────────────────────────────
+# ── 정보 출력 ─────────────────────────────────────────────────────────────────
+EFFECTIVE_BATCH=$((16 * NGPU))
+[ -n "$BATCH_SIZE" ] && EFFECTIVE_BATCH=$((BATCH_SIZE * NGPU))
 echo ""
 echo "============================================================"
-echo "  OpenVLA LoRA fine-tuning — LIBERO"
+echo "  OpenVLA Full Fine-tuning — LIBERO"
 echo "============================================================"
-echo "  Dataset root : $DATASET_ROOT"
-echo "  Output dir   : $OUTPUT_DIR"
-echo "  Config       : $CONFIG"
-echo "  GPUs         : $NGPU"
-echo "  WandB        : $WANDB_ENABLE"
+echo "  Dataset root   : $DATASET_ROOT"
+echo "  Output dir     : $OUTPUT_DIR"
+echo "  Config         : $CONFIG"
+echo "  GPUs           : $NGPU"
+echo "  Effective batch: $EFFECTIVE_BATCH  (${BATCH_SIZE:-16}/GPU × $NGPU)"
+echo "  FSDP           : ZeRO-3 (full_shard)"
+echo "  WandB          : $WANDB_ENABLE"
 echo "============================================================"
 echo ""
 
-# ── Launch ────────────────────────────────────────────────────────────────────
-# torchrun for multi-GPU DDP; falls back to direct python for single GPU
-if [ "$NGPU" -gt 1 ]; then
-    echo "Launching with torchrun ($NGPU GPUs) ..."
-    conda run -n "$CONDA_ENV" \
-        torchrun \
-            --standalone \
-            --nproc_per_node="$NGPU" \
-            "$SCRIPT_DIR/train.py" \
-            --config "$CONFIG" \
+# ── 학습 실행 ─────────────────────────────────────────────────────────────────
+conda run -n "$CONDA_ENV" \
+    accelerate launch \
+        --config_file "$TMP_FSDP_CONFIG" \
+        "$SCRIPT_DIR/train.py" \
+            --config   "$CONFIG" \
             --dataset_root "$DATASET_ROOT" \
-            --output_dir "$OUTPUT_DIR" \
+            --output_dir   "$OUTPUT_DIR" \
             $EXTRA_ARGS \
-        2>&1 | tee "$OUTPUT_DIR/train.log"
-else
-    echo "Launching on single GPU ..."
-    conda run -n "$CONDA_ENV" \
-        python "$SCRIPT_DIR/train.py" \
-            --config "$CONFIG" \
-            --dataset_root "$DATASET_ROOT" \
-            --output_dir "$OUTPUT_DIR" \
-            $EXTRA_ARGS \
-        2>&1 | tee "$OUTPUT_DIR/train.log"
-fi
+    2>&1 | tee "$OUTPUT_DIR/train.log"
 
 echo ""
-echo "Training complete. Checkpoints → $OUTPUT_DIR"
+echo "학습 완료. 체크포인트 → $OUTPUT_DIR"

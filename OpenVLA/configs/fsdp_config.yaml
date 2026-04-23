@@ -1,0 +1,26 @@
+# Accelerate FSDP config for B200 × 16 GPU full fine-tuning
+# Usage: accelerate launch --config_file configs/fsdp_config.yaml train.py ...
+
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  # FULL_SHARD = ZeRO-3: params + grads + optimizer states 모두 분산
+  fsdp_sharding_strategy: FULL_SHARD
+  # Transformer 레이어 단위로 auto wrap (OpenVLA는 Llama-2 기반)
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  fsdp_backward_prefetch_policy: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  # CPU offload: B200 VRAM이 충분하므로 비활성 (활성화하면 느려짐)
+  fsdp_offload_params: false
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 16
+rdzv_backend: static
+same_network: true

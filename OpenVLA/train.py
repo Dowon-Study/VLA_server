@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenVLA fine-tuning on LIBERO dataset using LoRA.
+OpenVLA full fine-tuning on LIBERO dataset.
 
 Reference: Kim et al., "OpenVLA: An Open-Source Vision-Language-Action Model" (2024)
            https://arxiv.org/abs/2406.09246
@@ -9,12 +9,13 @@ Usage:
     # Single GPU
     python train.py --dataset_root /path/to/dataset --output_dir ./runs/exp01
 
-    # Multi-GPU (via run_train.sh which calls torchrun)
-    torchrun --nproc_per_node=4 train.py --dataset_root /path/to/dataset --output_dir ./runs/exp01
+    # Multi-GPU with FSDP (B200 × 16, via run_train.sh)
+    accelerate launch --config_file configs/fsdp_config.yaml train.py \\
+        --dataset_root /path/to/dataset --output_dir ./runs/exp01
 
-    # Override config hyperparams
+    # CLI overrides
     python train.py --dataset_root /data --output_dir ./runs/exp01 \\
-        --max_steps 100000 --batch_size 32 --lr 1e-5
+        --max_steps 20000 --batch_size 32 --lr 1e-5
 """
 
 from __future__ import annotations
@@ -22,12 +23,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 
 import torch
 import yaml
-from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoModelForVision2Seq,
     AutoProcessor,
@@ -62,26 +61,21 @@ def load_config(path: str) -> _Namespace:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="OpenVLA LoRA fine-tuning on LIBERO")
-    p.add_argument("--config",       default="configs/libero_lora.yaml")
+    p = argparse.ArgumentParser(description="OpenVLA full fine-tuning on LIBERO")
+    p.add_argument("--config",       default="configs/libero_full.yaml")
     p.add_argument("--dataset_root", required=True,
                    help="Root of lerobot-format LIBERO dataset")
     p.add_argument("--output_dir",   required=True,
                    help="Directory for checkpoints and logs")
 
-    # CLI overrides (all optional — fall back to config values)
+    # CLI overrides
     p.add_argument("--pretrained",   default=None,  help="HF model ID or local path")
     p.add_argument("--max_steps",    type=int,   default=None)
-    p.add_argument("--batch_size",   type=int,   default=None,
-                   help="Per-device train batch size")
+    p.add_argument("--batch_size",   type=int,   default=None, help="Per-device train batch size")
     p.add_argument("--lr",           type=float, default=None)
-    p.add_argument("--lora_rank",    type=int,   default=None)
-    p.add_argument("--lora_alpha",   type=int,   default=None)
     p.add_argument("--save_steps",   type=int,   default=None)
-    p.add_argument("--camera_key",   default=None,
-                   help="Camera key, e.g. observation.images.image")
-    p.add_argument("--wandb",        action="store_true",
-                   help="Enable Weights & Biases logging")
+    p.add_argument("--camera_key",   default=None)
+    p.add_argument("--wandb",        action="store_true")
     p.add_argument("--run_name",     default=None)
     return p.parse_args()
 
@@ -95,37 +89,36 @@ def main():
     cfg = load_config(args.config)
 
     # CLI overrides
-    pretrained   = args.pretrained  or cfg.model.pretrained
-    max_steps    = args.max_steps   or cfg.training.max_steps
-    batch_size   = args.batch_size  or cfg.training.per_device_train_batch_size
-    lr           = args.lr          or cfg.training.learning_rate
-    lora_rank    = args.lora_rank   or cfg.lora.rank
-    lora_alpha   = args.lora_alpha  or cfg.lora.alpha
-    save_steps   = args.save_steps  or cfg.training.save_steps
-    camera_key   = args.camera_key  or cfg.data.camera_key
+    pretrained = args.pretrained or cfg.model.pretrained
+    max_steps  = args.max_steps  or cfg.training.max_steps
+    batch_size = args.batch_size or cfg.training.per_device_train_batch_size
+    lr         = args.lr         or cfg.training.learning_rate
+    save_steps = args.save_steps or cfg.training.save_steps
+    camera_key = args.camera_key or cfg.data.camera_key
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Print run config ──────────────────────────────────────────────
+    num_gpus = torch.cuda.device_count()
+    eff_batch = batch_size * max(num_gpus, 1) * cfg.training.gradient_accumulation_steps
     print("=" * 60)
-    print("  OpenVLA LoRA fine-tuning — LIBERO")
+    print("  OpenVLA Full Fine-tuning — LIBERO")
     print("=" * 60)
     print(f"  Pretrained   : {pretrained}")
     print(f"  Dataset root : {args.dataset_root}")
     print(f"  Output dir   : {args.output_dir}")
     print(f"  Max steps    : {max_steps}")
-    print(f"  Batch/GPU    : {batch_size}")
+    print(f"  Batch/GPU    : {batch_size}  (effective: {eff_batch})")
     print(f"  LR           : {lr}")
-    print(f"  LoRA rank    : {lora_rank} / alpha: {lora_alpha}")
+    print(f"  GPUs         : {num_gpus}")
     print(f"  Camera       : {camera_key}")
     print("=" * 60)
 
     # ── Load processor ────────────────────────────────────────────────
-    print("\n[1/4] Loading processor ...")
+    print("\n[1/3] Loading processor ...")
     processor = AutoProcessor.from_pretrained(
         pretrained, trust_remote_code=True
     )
-    # OpenVLA uses left-padding
     processor.tokenizer.padding_side = "left"
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -136,7 +129,7 @@ def main():
     )
 
     # ── Load model ────────────────────────────────────────────────────
-    print("[2/4] Loading model ...")
+    print("[2/3] Loading model ...")
     model = AutoModelForVision2Seq.from_pretrained(
         pretrained,
         torch_dtype=torch.bfloat16,
@@ -144,27 +137,24 @@ def main():
         attn_implementation=cfg.model.attn_implementation,
     )
 
-    # Resize embeddings to include newly added action tokens
-    # pad_to_multiple_of=64 keeps matmul-friendly sizes
+    # Resize embeddings for newly added action tokens
     model.resize_token_embeddings(
         len(processor.tokenizer), pad_to_multiple_of=64
     )
 
-    # ── Apply LoRA ────────────────────────────────────────────────────
-    print("[3/4] Applying LoRA ...")
-    lora_cfg = LoraConfig(
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        target_modules=cfg.lora.target_modules,
-        lora_dropout=cfg.lora.dropout,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
+    # Gradient checkpointing: 활성화 메모리 절약 (full FT 필수)
+    if cfg.model.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    # Full fine-tuning: 모든 파라미터 학습
+    for param in model.parameters():
+        param.requires_grad = True
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Trainable parameters: {total_params / 1e9:.2f}B (100%)")
 
     # ── Dataset ───────────────────────────────────────────────────────
-    print("[4/4] Building dataset ...")
+    print("[3/3] Building dataset ...")
     train_dataset = LIBERODataset(
         dataset_root=args.dataset_root,
         processor=processor,
@@ -179,10 +169,7 @@ def main():
 
     # ── Training arguments ────────────────────────────────────────────
     report_to = "wandb" if args.wandb else "none"
-    run_name  = args.run_name or f"openvla_libero_lora_r{lora_rank}"
-
-    warmup_steps = cfg.training.warmup_steps
-    decay_steps  = max(1, max_steps - warmup_steps)
+    run_name  = args.run_name or "openvla_libero_full"
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -191,17 +178,19 @@ def main():
         # Batch
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
-        # Optimizer (AdamW, β1=0.9, β2=0.95, paper §B.2)
+        # Optimizer (AdamW β1=0.9, β2=0.95, paper §B.2)
         learning_rate=lr,
         lr_scheduler_type=cfg.training.lr_scheduler,
-        warmup_steps=warmup_steps,
+        warmup_steps=cfg.training.warmup_steps,
         weight_decay=cfg.training.weight_decay,
         adam_beta1=cfg.training.adam_beta1,
         adam_beta2=cfg.training.adam_beta2,
         max_grad_norm=cfg.training.max_grad_norm,
         # Precision
         bf16=cfg.training.bf16,
-        tf32=True,          # Ampere+ tensor cores
+        tf32=True,
+        # Memory: gradient checkpointing은 model에서 이미 활성화
+        gradient_checkpointing=False,   # Trainer 중복 설정 방지
         # Save / log
         save_steps=save_steps,
         save_total_limit=cfg.training.save_total_limit,
@@ -213,6 +202,8 @@ def main():
         remove_unused_columns=False,
         report_to=report_to,
         run_name=run_name,
+        # FSDP: accelerate config로 제어 (여기선 비워둠)
+        ddp_find_unused_parameters=False,
     )
 
     # ── Train ─────────────────────────────────────────────────────────
@@ -227,11 +218,11 @@ def main():
     trainer.train()
 
     # ── Save final checkpoint ─────────────────────────────────────────
-    final_dir = Path(args.output_dir) / "final_lora"
+    final_dir = Path(args.output_dir) / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     trainer.save_model(str(final_dir))
     processor.save_pretrained(str(final_dir))
-    print(f"\nSaved final LoRA checkpoint → {final_dir}")
+    print(f"\nSaved final checkpoint → {final_dir}")
 
     # Save run metadata
     meta = {
@@ -239,9 +230,9 @@ def main():
         "dataset_root": args.dataset_root,
         "max_steps": max_steps,
         "lr": lr,
-        "lora_rank": lora_rank,
-        "lora_alpha": lora_alpha,
         "batch_size": batch_size,
+        "effective_batch": eff_batch,
+        "fine_tuning": "full",
     }
     with open(Path(args.output_dir) / "run_config.json", "w") as f:
         json.dump(meta, f, indent=2)
