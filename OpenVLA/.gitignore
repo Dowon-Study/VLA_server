@@ -1,0 +1,38 @@
+
+# Checkpoints & runs
+runs/
+*.pt
+*.bin
+*.safetensors
+
+# Data (never commit dataset)
+data/
+dataset*/
+*.parquet
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+*.so
+
+# HuggingFace cache
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+wandb/
