@@ -8,9 +8,9 @@
 #   - OpenVLA 논문은 LoRA(LR=5e-4)를 사용했으나, 본 실험은 Full FT 방식
 #   - Full FT LR: 2e-5  (대형 모델 Full FT 표준; LoRA 5e-4의 1/25 수준)
 #     → 너무 높으면 catastrophic forgetting 발생
-#   - 배치: 16/GPU × 16 GPU = 256  (논문 per-GPU 배치 16 동일, GPU 수 증가)
+#   - 현재 기본 설정: 65/GPU × 2 GPU = 130  (B200 2장 공격적 활용)
 #   - 스텝: 논문 기준 50K(Spatial/Object), 80K(LIBERO-10) 따름
-#   - FSDP ZeRO-3: 16 GPU에 파라미터+옵티마이저 상태 분산
+#   - FSDP ZeRO-3: 2 GPU에 파라미터+옵티마이저 상태 분산
 # ============================================================
 
 model:
@@ -41,9 +41,9 @@ training:
   max_steps: 50000
 
   # ── Batch ──────────────────────────────────────────────────
-  # 논문과 동일한 GPU당 배치 16
-  # 유효 배치 = 16 × 16 GPU = 256
-  per_device_train_batch_size: 16
+  # B200 192GB VRAM을 적극 활용하는 기본값
+  # 유효 배치 = 65 × 2 GPU = 130
+  per_device_train_batch_size: 65
   gradient_accumulation_steps: 1
 
   # ── Optimizer (AdamW, 논문 §B.2) ───────────────────────────
@@ -67,5 +67,17 @@ data:
   action_bins: 256
   action_dim: 7
   camera_key: "observation.images.image"
-  # actions → [-1,1] 정규화: min/max 사용
-  norm_mode: "minmax"
+  # Save this key into model.config.norm_stats for predict_action(..., unnorm_key=...).
+  # Use libero_spatial/libero_object/libero_goal/libero_10 if evaluating with the official script.
+  unnorm_key: "libero_custom"
+  # OpenVLA normalizes actions with robust quantile bounds and unnormalizes with q01/q99.
+  # Falls back to min/max if the local LeRobot stats.json has no q01/q99.
+  norm_mode: "quantile"
+  # LIBERO OpenVLA checkpoints were trained with random crop + color jitter.
+  image_aug: true
+  random_crop_scale: 0.9
+  color_jitter: 0.2
+  hue_jitter: 0.05
+  # Official modified LIBERO datasets remove no-op transitions.
+  skip_noop_actions: true
+  noop_threshold: 1.0e-4

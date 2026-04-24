@@ -79,7 +79,7 @@ if $PIP install flash-attn --no-build-isolation 2>/dev/null; then
     echo "  flash-attn installed."
 else
     echo "  [WARN] flash-attn build failed — falling back to 'eager' attention."
-    echo "         Set attn_implementation: eager in configs/libero_lora.yaml"
+    echo "         Set attn_implementation: eager in configs/libero_full.yaml"
 fi
 
 # ── Dev tools (optional) ─────────────────────────────────────────────────────

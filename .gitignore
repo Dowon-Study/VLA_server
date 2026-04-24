@@ -1,0 +1,7 @@
+Libeoro_dataset/
+.codex
+openpi/.conda/
+openpi/.venv/
+openpi/.cache/
+OpenVLA/.conda/
+OpenVLA/.cache/

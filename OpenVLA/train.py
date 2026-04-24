@@ -27,6 +27,7 @@ from pathlib import Path
 
 import torch
 import yaml
+from transformers import AutoConfig, AutoImageProcessor
 from transformers import (
     AutoModelForVision2Seq,
     AutoProcessor,
@@ -75,6 +76,12 @@ def parse_args():
     p.add_argument("--lr",           type=float, default=None)
     p.add_argument("--save_steps",   type=int,   default=None)
     p.add_argument("--camera_key",   default=None)
+    p.add_argument("--unnorm_key",   default=None,
+                   help="Key saved in OpenVLA norm_stats for predict_action unnormalization")
+    p.add_argument("--image_aug",    dest="image_aug", action="store_true", default=None)
+    p.add_argument("--no_image_aug", dest="image_aug", action="store_false")
+    p.add_argument("--skip_noops",   dest="skip_noops", action="store_true", default=None)
+    p.add_argument("--keep_noops",   dest="skip_noops", action="store_false")
     p.add_argument("--wandb",        action="store_true")
     p.add_argument("--run_name",     default=None)
     return p.parse_args()
@@ -95,8 +102,12 @@ def main():
     lr         = args.lr         or cfg.training.learning_rate
     save_steps = args.save_steps or cfg.training.save_steps
     camera_key = args.camera_key or cfg.data.camera_key
+    unnorm_key = args.unnorm_key or cfg.data.get("unnorm_key", "libero_custom")
+    image_aug = cfg.data.get("image_aug", True) if args.image_aug is None else args.image_aug
+    skip_noops = cfg.data.get("skip_noop_actions", True) if args.skip_noops is None else args.skip_noops
 
     os.makedirs(args.output_dir, exist_ok=True)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     # ── Print run config ──────────────────────────────────────────────
     num_gpus = torch.cuda.device_count()
@@ -112,14 +123,30 @@ def main():
     print(f"  LR           : {lr}")
     print(f"  GPUs         : {num_gpus}")
     print(f"  Camera       : {camera_key}")
+    print(f"  Unnorm key   : {unnorm_key}")
+    print(f"  Image aug    : {image_aug}")
+    print(f"  Skip no-ops  : {skip_noops}")
     print("=" * 60)
 
     # ── Load processor ────────────────────────────────────────────────
     print("\n[1/3] Loading processor ...")
+    try:
+        from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+        from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+        from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+        AutoConfig.register("openvla", OpenVLAConfig)
+        AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    except Exception:
+        # HF Hub checkpoints already include remote code; local converted checkpoints may need registration.
+        pass
+
     processor = AutoProcessor.from_pretrained(
         pretrained, trust_remote_code=True
     )
-    processor.tokenizer.padding_side = "left"
+    processor.tokenizer.padding_side = "right"
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
@@ -135,16 +162,22 @@ def main():
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation=cfg.model.attn_implementation,
+        low_cpu_mem_usage=True,
     )
 
-    # Resize embeddings for newly added action tokens
-    model.resize_token_embeddings(
-        len(processor.tokenizer), pad_to_multiple_of=64
-    )
+    # Keep the pretrained OpenVLA action-token contract: no new tokens/resize.
+    norm_stats = {unnorm_key: ActionTokenizer.load_openvla_norm_stats(args.dataset_root)}
+    model.config.norm_stats = norm_stats
+    if hasattr(model, "norm_stats"):
+        model.norm_stats = norm_stats
 
     # Gradient checkpointing: 활성화 메모리 절약 (full FT 필수)
     if cfg.model.gradient_checkpointing:
         model.gradient_checkpointing_enable()
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    if hasattr(model, "language_model") and hasattr(model.language_model.config, "use_cache"):
+        model.language_model.config.use_cache = False
 
     # Full fine-tuning: 모든 파라미터 학습
     for param in model.parameters():
@@ -162,8 +195,18 @@ def main():
         camera_key=camera_key,
         image_size=cfg.model.image_size,
         norm_mode=cfg.data.norm_mode,
+        image_aug=image_aug,
+        random_crop_scale=cfg.data.get("random_crop_scale", 0.9),
+        color_jitter=cfg.data.get("color_jitter", 0.2),
+        hue_jitter=cfg.data.get("hue_jitter", 0.05),
+        skip_noop_actions=skip_noops,
+        noop_threshold=cfg.data.get("noop_threshold", 1e-4),
     )
     print(f"  Dataset size: {len(train_dataset)} frames")
+    norm_stats[unnorm_key]["num_transitions"] = len(train_dataset)
+    stats_path = Path(args.output_dir) / "dataset_statistics.json"
+    with open(stats_path, "w") as f:
+        json.dump(norm_stats, f, indent=2)
 
     collator = DataCollatorForOpenVLA(processor.tokenizer)
 
@@ -233,6 +276,10 @@ def main():
         "batch_size": batch_size,
         "effective_batch": eff_batch,
         "fine_tuning": "full",
+        "action_tokenizer": "openvla_vocab_tail",
+        "unnorm_key": unnorm_key,
+        "image_aug": image_aug,
+        "skip_noop_actions": skip_noops,
     }
     with open(Path(args.output_dir) / "run_config.json", "w") as f:
         json.dump(meta, f, indent=2)

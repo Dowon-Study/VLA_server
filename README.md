@@ -9,7 +9,7 @@ B200 서버에서 실행하는 VLA(Vision-Language-Action) 모델 학습 코드 
 
 | 폴더 | 설명 |
 |------|------|
-| [`OpenVLA/`](OpenVLA/) | OpenVLA-7B LoRA 파인튜닝 on LIBERO |
+| [`OpenVLA/`](OpenVLA/) | OpenVLA-7B Full Fine-tuning on LIBERO |
 
 ---
 
@@ -25,7 +25,7 @@ SigLIP + DINOv2 비전 인코더와 Llama-2-7B 언어 모델을 결합한 구조
 
 ### 파인튜닝 방식
 
-- **LoRA** (rank 32, alpha 16) — 전체 파라미터의 약 1%만 학습
+- **Full fine-tuning** — OpenVLA-7B 전체 파라미터 학습
 - 액션 이산화: 각 액션 차원을 256개의 bin으로 나눠 토큰으로 변환
 - 입력 프롬프트 형식:
   ```
@@ -40,7 +40,7 @@ SigLIP + DINOv2 비전 인코더와 Llama-2-7B 언어 모델을 결합한 구조
 | Learning rate | 2e-5 |
 | LR 스케줄 | Constant + 500-step warmup |
 | 배치 크기 (GPU당) | 16 |
-| LoRA rank / alpha | 32 / 16 |
+| Fine-tuning | Full FT (LoRA 미사용) |
 | 옵티마이저 | AdamW (β₁=0.9, β₂=0.95) |
 | 학습 스텝 | 50,000 |
 | 액션 bins | 256 |

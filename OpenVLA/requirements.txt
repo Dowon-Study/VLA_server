@@ -4,14 +4,17 @@
 # PyTorch is handled separately in setup.sh (CUDA-version-specific)
 
 # ── Core ML ───────────────────────────────────────────────────────────────────
-transformers>=4.40.0
+# OpenVLA HF remote code warns on newer Transformers/Tokenizers; keep the
+# paper/public-checkpoint stack unless you intentionally validate an upgrade.
+transformers==4.40.1
+tokenizers==0.19.1
+timm==0.9.10
 accelerate>=0.30.0
 datasets>=2.18.0
 bitsandbytes>=0.43.0          # quantization (optional but useful)
 
 # ── OpenVLA model (HuggingFace hub) ──────────────────────────────────────────
 huggingface_hub>=0.22.0
-tokenizers>=0.19.0
 safetensors>=0.4.0
 
 # ── Data loading ──────────────────────────────────────────────────────────────
